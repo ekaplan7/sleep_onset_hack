@@ -1,0 +1,135 @@
+"""Aperiodic/spectral features + bin-weighted gradient boosting.
+
+Same features as ``aperiodic_only``, but the head is a gradient-boosting
+regressor with **absolute-error loss** and **per-sample weights equal to the
+W-bMAE bin weights (10/5/3/1)**. That trains the model to minimize the
+*competition* metric instead of plain MSE -- the lever the MSE-trained
+baselines were missing, and the most direct shot at beating the median with
+actual signal.
+
+Self-contained: torch + sklearn + benchmark_utils only. No braindecode,
+no specparam/FOOOF (aperiodic exponent/offset from a log-log PSD fit).
+"""
+
+import joblib
+import numpy as np
+import torch
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from benchmark_utils.base_solver import CompetSolver
+from benchmark_utils.data import to_numpy
+
+BANDS = {
+    "delta": (0.5, 4.0), "theta": (4.0, 8.0), "alpha": (8.0, 12.0),
+    "sigma": (12.0, 16.0), "beta": (16.0, 30.0),
+}
+FIT_LO, FIT_HI = 2.0, 40.0
+EPS = 1e-8
+CAP = 600.0
+BIN_EDGES = np.array([0.0, 40.0, 90.0, 300.0, 600.0])
+BIN_WEIGHTS = np.array([10.0, 5.0, 3.0, 1.0])
+
+
+def spectral_features(X, sfreq, device):
+    """(B, C, T) -> numpy (B, C*k) of per-channel spectral features."""
+    X = torch.as_tensor(X, dtype=torch.float32, device=device)
+    if X.ndim == 2:
+        X = X[None]
+    B, C, T = X.shape
+    sf = float(sfreq)
+    xw = (X - X.mean(dim=-1, keepdim=True)) * torch.hann_window(
+        T, device=X.device, dtype=X.dtype)
+    spec = torch.fft.rfft(xw, dim=-1)
+    psd = spec.real ** 2 + spec.imag ** 2
+    freqs = torch.fft.rfftfreq(T, d=1.0 / sf).to(X.device)
+
+    feats = []
+    total_mask = (freqs >= 1.0) & (freqs <= 40.0)
+    total = psd[..., total_mask].sum(-1).clamp_min(EPS)
+    bp = {}
+    for name, (lo, hi) in BANDS.items():
+        m = (freqs >= lo) & (freqs < hi)
+        p = psd[..., m].sum(-1).clamp_min(EPS)
+        bp[name] = p
+        feats.append(torch.log(p))
+    for name in BANDS:
+        feats.append(bp[name] / total)
+    feats.append(bp["delta"] / bp["beta"])
+    feats.append((bp["delta"] + bp["theta"]) / (bp["alpha"] + bp["beta"]))
+
+    m = (freqs >= FIT_LO) & (freqs <= FIT_HI)
+    lf = torch.log10(freqs[m].clamp_min(EPS))
+    ly = torch.log10(psd[..., m].clamp_min(EPS))
+    lf_c = lf - lf.mean()
+    ly_c = ly - ly.mean(dim=-1, keepdim=True)
+    slope = (ly_c * lf_c).sum(-1) / (lf_c ** 2).sum().clamp_min(EPS)
+    feats.append(-slope)
+    feats.append(ly.mean(dim=-1) - slope * lf.mean())
+
+    p_b = psd[..., total_mask]
+    f_b = freqs[total_mask]
+    tot = p_b.sum(-1, keepdim=True).clamp_min(EPS)
+    pn = p_b / tot
+    feats.append(-(pn * torch.log(pn + EPS)).sum(-1))
+    cum = torch.cumsum(p_b, dim=-1) / tot
+    idx = (cum < 0.95).sum(-1).clamp(max=f_b.numel() - 1)
+    feats.append(f_b[idx])
+
+    out = torch.stack(feats, dim=-1)
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out.reshape(B, -1).detach().cpu().numpy()
+
+
+class FeatureGBM:
+    def __init__(self, meta, pipe=None):
+        self.sfreq = float(meta["sfreq"])
+        self.device = meta.get("device", "cpu")
+        self.pipe = pipe
+
+    def fit(self, train_loader):
+        feats, tgts = [], []
+        for X, y, _info in train_loader:
+            feats.append(spectral_features(X, self.sfreq, self.device))
+            tgts.append(to_numpy(y).ravel())
+        feats = np.concatenate(feats)
+        y = np.concatenate(tgts)
+        # per-sample weight = W-bMAE bin weight of the true latency
+        idx = np.clip(np.digitize(y, BIN_EDGES[1:-1], right=False), 0, 3)
+        sw = BIN_WEIGHTS[idx]
+        self.pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("reg", HistGradientBoostingRegressor(loss="absolute_error")),
+        ])
+        self.pipe.fit(feats, y, reg__sample_weight=sw)
+        return self
+
+    def predict(self, X):
+        f = spectral_features(X, self.sfreq, self.device)
+        return np.clip(self.pipe.predict(f), 0.0, CAP)
+
+
+class Solver(CompetSolver):
+
+    name = "Aperiodic-Weighted"
+
+    requirements = []
+
+    def load_model(self, meta):
+        model = FeatureGBM(meta)
+        weights = meta["submission_dir"] / "weights.joblib"
+        if weights.exists():
+            model.pipe = joblib.load(weights)
+        elif self.train_loader is None:
+            raise FileNotFoundError(
+                "Aperiodic-Weighted needs weights.joblib; train with "
+                "training=True and upload the exported folder."
+            )
+        return model
+
+    def fit(self, model, train_loader):
+        model.fit(train_loader)
+
+    def save_model(self, model, path):
+        joblib.dump(model.pipe, path / "weights.joblib")
